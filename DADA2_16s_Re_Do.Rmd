@@ -1,0 +1,414 @@
+---
+title: "soyabean_16s_Re_Do"
+---
+
+# load packages
+```{r}
+#Verifying the library
+library(dada2); packageVersion("dada2")
+library(vegan)
+```
+
+# perform taxonomic assignment using SILVA132 
+```{r}
+setwd("/Users/bulbulahmed/Documents/SoyabeanProject/DADA_Re_Do_2021/")
+path <- "/Users/bulbulahmed/Documents/SoyabeanProject/MiSeq_soya/16s_Reads/"
+list.files(path)
+
+# Forward and reverse fastq filenames have format: Complicated_SAMPLENAME_R1.fastq and Complicated_SAMPLENAME_R2.fastq
+fnFs <- sort(list.files(path, pattern="_R1.fastq", full.names = TRUE)) 
+fnRs <- sort(list.files(path, pattern="_R2.fastq", full.names = TRUE))
+# Extract sample names. Our files have super complicated name, so we will need the third spliting.fastq
+(sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1))
+
+##5)Inspect read quality profile
+##Forward reads
+plotQualityProfile(fnFs[1:4])  ## We are just doing this check for two samples, because every samples from the same run will have the same profile
+##I would cut the forward at 240bp
+
+##Reverse reads: 
+plotQualityProfile(fnRs[1:4])
+#I would cut the reverses at 235bp (I would have cut it earlier, but I won't have enough overlap if I do that)
+```
+# Filter and trim ---------------------------------------------------------
+```{r}
+# Place filtered files in filtered/ subdirectory. We are just creating the subdirectory here. Cause we need to specify to the function filterAndTrim the path to the input fastqfiles and the output fastqfiles
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq"))
+
+#We’ll use standard filtering parameters: maxN=0 (DADA2 requires no Ns), truncQ=2, rm.phix=TRUE and maxEE=2. The maxEE parameter sets the maximum number of “expected errors” allowed in a read, which is a better filter than simply averaging quality scores.
+
+###The first time I ran the pipeline, the majority of the reads were lost during the merge, so our initial truncation might have been too stringent considering that the amplicons length is about 420 and that we are sequencing the primers. So we should not truncate too much. So I re-ran the script but with a less stringent truncation
+
+##filtering (took about 30 minutes) start 11:16; end 11:18
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs,  truncLen=c(245,235), trimLeft=c(17,21),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE, verbose=TRUE) # On Windows set multithread=FALSE
+
+##Sanity check
+head(out)
+##Doesn't seem to have lost too many reads, we will check this by creating a third column which will be the ratio of the first two column (out/in)
+
+#Changing the matrix to a data.frame
+out.df<-as.data.frame(out)
+out.df$ratio<-(out.df$reads.out/out.df$reads.in)
+head(out.df)
+mean(out.df$ratio)
+##We ketp 79.72% of the reads. This is quite good
+
+##saving the table
+write.table(out.df, file="readsAfterFilter.txt") 
+```
+# Learn error rates and denoise -------------------------------------------
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE, verbose=TRUE)  #start 10:30; end: 10:37
+errR <- learnErrors(filtRs, multithread=TRUE, verbose=TRUE)  ##Start 10:40; end: 10:46
+###Dada2 will learn the error of shared samples. They have to come from the same run (so they share the same error). 
+
+##It is always worthwhile, as a sanity check if nothing else, to visualize the estimated error rates:
+plotErrors(errF, nominalQ=TRUE) 
+#If nominalQ=TRUE, plot the expected error rates (red line) if quality scores exactly matched their nominal definition: Q = -10 log10(p_err)
+##What to look for:
+##a) Does the model (black line) reasonably fit the observations (black point):not excellent but not soo bad
+##b) Do the error rates moslty decrease with quality score: yes
+
+##Usually you want to have the error rates to decrease with increasing quality score. The algorithm is going to use the error rate base on the black line
+```
+# Dereplication -----------------------------------------------------------
+```{r}
+#Dereplication combines all identical sequencing reads into into “unique sequences” with a corresponding “abundance” equal to the number of reads with that unique sequence. Dereplication substantially reduces computation time by eliminating redundant comparisons.
+
+#Dereplication in the DADA2 pipeline has one crucial addition from other pipelines: DADA2 retains a summary of the quality information associated with each unique sequence. The consensus quality profile of a unique sequence is the average of the positional qualities from the dereplicated reads. These quality profiles inform the error model of the subsequent sample inference step, significantly increasing DADA2’s accuracy.
+derepFs <- derepFastq(filtFs, verbose=TRUE)  ##start 10:04; ends:10:06
+derepRs <- derepFastq(filtRs, verbose=TRUE)  ##start 10:07; ends: 10:09
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+##To check the length of the reads (to see if you made a mistake with filtering and assess if your reads are going to overlap)
+derepFs$JNR37
+derepFs$JNR1
+derepRs$JNR1
+derepRs$JNR25
+```
+# Sample inference --------------------------------------------------------
+#The DADA2 algorithm inferred 617 true sequence variants from the 6392 unique sequences in the foward reads of the first sample. There is much more to the dada-class return object than this (see help("dada-class") for some info), including multiple diagnostics about the quality of each denoised sequence variant, but that is beyond the scope of an introductory tutorial.
+
+###Pooling - we used the pseudo-pool
+#Extensions: By default, the dada function processes each sample independently. However, pooling information across samples can increase sensitivity to sequence variants that may be present at very low frequencies in multiple samples. The dada2 package offers two types of pooling. dada(..., pool=TRUE) performs standard pooled processing, in which all samples are pooled together for sample inference. dada(..., pool="pseudo") performs pseudo-pooling, in which samples are processed independently after sharing information between samples, approximating pooled sample inference in linear time.
+#Advantage: Dada2 just considered singletons has error and will drop it; if you pool you may have singleton in one sample, but if you find it in other it will keep it!
+#Downside: computation cost
+
+##Dada function parameters:
+#omegaA: controls the p-value threshold at which to call new ASVs. very conservative. Most of the signal it is very robust to omegaA. If you put it more stringent: you'll detect lower amount of ASV. The rest will be drop. If you want to detect more: you can put is less stringent. 
+#min_abundant: Sets a minimum abundance threshold to call new ASVs.
+#Most of the time, you won't mess with these
+```{r}
+# Sample inference 
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE, pool="pseudo") #Start 10:11; end: 10:58
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE, pool="pseudo") #start 11:49 ; ends: 12:30
+dadaFs[[1]]  ##617 sequence variants were inferred from 6511 input unique sequences.
+dadaRs[[1]]  ##638 sequence variants were inferred from 6630 input unique sequences.
+
+##Utility functions:
+head(getSequences(dadaFs[[1]]))
+head(getUniques(dadaFs[[1]]))
+```
+# Merging reads -----------------------------------------------------------
+#We now merge the forward and reverse reads together to obtain the full denoised sequences. Merging is performed by aligning the denoised forward reads with the reverse-complement of the corresponding denoised reverse reads, and then constructing the merged “contig” sequences. By default, merged sequences are only output if the forward and reverse reads overlap by at least 12 bases, and are identical to each other in the overlap region.
+##Three merging scenarios:
+##A) overlap: go ahead normally
+##B) overhang: forward reads go further that the reverse read. trimOverhang=TRUE
+##C) seperated: don't overlap. justConcatenate=T).
+##If you have a mixte: a) Don't; b) truncate so you are in a single scenario; c) only use the forward reads
+
+#The mergers object is a list of data.frames from each sample. Each data.frame contains the merged $sequence, its $abundance, and the indices of the $forward and $reverse sequence variants that were merged. Paired reads that did not exactly overlap were removed by mergePairs, further reducing spurious output.
+
+```{r}
+#Merging reads
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE) #start: 1:35; end: 1:47 (max)
+head(mergers[[1]])
+##Construct sequence table
+#We can now construct an amplicon sequence variant table (ASV) table, a higher-resolution version of the OTU table produced by traditional methods.
+seqtab <- makeSequenceTable(mergers)  #start: 1:48; end: 1:48
+dim(seqtab)
+#The sequence table is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants. 
+#[1]   192 125,467 ##Way too big!! Might be the impact of the pool.ing. We will use the collapseMismatch function to try to reduce it
+
+##You can use the collapse nomissmatch. Cause sometimes the ASV can be exactly the same, but with one more bp. 
+#seqtab2<-collapseNoMismatch(seqtab)  ##Took a lot of time, but I dont exactly know how much (took more than 30 hours) start 13:45; end
+#dim(seqtab)
+##Reduced from 125,467 to 60981 which is still big but more realistic
+
+##We are going to save this table
+class(seqtab)
+write.table(seqtab, file="SequenceTable_16s_cals_canna_root.txt", sep="\t")
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+##The first row is the different numbers of base pair that we have in our ASV. And the second row is how many ASV have that number of base pair. From there you can choose to remove weird ASV (weird=those who have fewer or more base pair)
+
+##Our data: mmm a bit weird cause the majority of the sequences were about 428bp and reduces after , but the limit is 430bp. Does that mean that if I had more longer reads I would have more sequences...We also have some ASV that are way below the expected lenght of the amplicon. Lets< remove them
+#### the majority of the seq were between 422 and 430
+
+#Considerations for your own data: Sequences that are much longer or shorter than expected may be the result of non-specific priming. You can remove non-target-length sequences with base R manipulations of the sequence table (eg. seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% seq(250,256)]). This is analogous to “cutting a band” in-silico to get amplicons of the targeted length.
+
+seqtab2<-seqtab[,nchar(colnames(seqtab)) %in% seq(398,430)]  #We had 9 ASV that were of length 398 and only 1 or 2 ASV for each length below that, but we start to see >1000ASV above 402 bp
+dim(seqtab2)
+#40 18994  ###we only lost 162 ASV
+
+write.table(seqtab2, file="SequenceTable_16s_cals_canna_root.txt", sep="\t")
+```
+# Removing chimeras -------------------------------------------------------
+#The core dada method corrects substitution and indel errors, but chimeras remain. Fortunately, the accuracy of the sequence variants after denoising makes identifying chimeras simpler than it is when dealing with fuzzy OTUs. Chimeric sequences are identified if they can be exactly reconstructed by combining a left-segment and a right-segment from two more abundant “parent” sequences.
+
+###The concensus method: will look at one chimera identified in one sample; if it is present in the other sample, it will not be considered as a chimera, but if it is not present in other sample: chimera. 
+
+##If you have pool your samples before, you might want to do it again. 
+
+##If you have longer elongation steps during pcr (so it gives time to really finished and not do a chimera), you might reduced your chimera. 
+
+```{r}
+# Removing chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="pooled", multithread=F, verbose=F) #start 9:31; end: 10:40
+#Identified 34826 bimeras out of 60819 input sequences.....half of them are chimera, but that"s a way more realistic number of ASVs
+dim(seqtab.nochim)
+#192 25993  ##25,993/60,819   ##about 43% of the sequence variants are left, so 57% were remove. However, if we account for the abundances of the variants: 
+```
+# Sanitiy check - reads lost during each step -----------------------------
+```{r}
+# Sanitiy check
+sum(seqtab.nochim)/sum(seqtab)  ##simple division of the number of reads in each dataset
+#0.88735
+
+#save results:
+write.table(seqtab.nochim, "ASVTable_16s_cals_canna_root.txt", sep="\t")
+
+#The frequency of chimeric sequences varies substantially from dataset to dataset, and depends on on factors including experimental procedures and sample complexity. Here chimeras make up about 57% of the merged sequence variants, but when we account for the abundances of those variants we see they account for only about 12% of the merged sequence reads.
+
+##***Considerations for your own data: Most of your reads should remain after chimera removal (it is not uncommon for a majority of sequence variants to be removed though). If most of your reads were removed as chimeric, upstream processing may need to be revisited. In almost all cases this is caused by primer sequences with ambiguous nucleotides that were not removed prior to beginning the DADA2 pipeline.
+
+##Track reads through the pipeline
+#As a final check of our progress, we’ll look at the number of reads that made it through each step in the pipeline:
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+#Considerations for your own data: This is a great place to do a last sanity check. Outside of filtering (depending on how stringent you want to be) there should no step in which a majority of reads are lost. If a majority of reads failed to merge, you may need to revisit the truncLen parameter used in the filtering step and make sure that the truncated reads span your amplicon. If a majority of reads were removed as chimeric, you may need to revisit the removal of primers, as the ambiguous nucleotides in unremoved primers interfere with chimera identification.
+
+##If you are loosing more than 30% of your reads in denoise, merge and nonchim: there is a problem. 
+##If majority of the reads were remove during merged: truncation too stringent
+##If majority of the reads were remove during nonchim: you might still have your primers on
+
+track.df<-as.data.frame(track)
+(mean.input<-mean(track.df$input)) 
+(mean.filter<-mean(track.df$filtered))
+(mean.denoisF<-mean(track.df$denoisedF))
+(mean.denoiseR<-mean(track.df$denoisedR))
+(mean.merge<-mean(track.df$merged))
+(mean.chim<-mean(track.df$nonchim))
+
+##%of sequences left after fitler
+mean.filter/mean.input  ##0.79
+#% of sequences left after denoisedF
+mean.denoisF/mean.filter  #0.82
+#%of sequences left after desoisedR
+mean.denoiseR/mean.filter  ##0.88
+#%of sequences left after merge on the number of F reads
+mean.merge/mean.denoisF  ##0.75
+#%of sequences left after merge on the number of R reads
+mean.merge/mean.denoiseR ##0.72
+#of sequences left after chimera
+mean.chim/mean.merge  ##0.88
+```
+##On average, we lost less than 30% at each step. We did lost about 25/27% of the reads at the merge step, but this is likely due to the long size of the amplicon
+
+##Assign taxonomy
+#It is common at this point, especially in 16S/18S/ITS amplicon sequencing, to assign taxonomy to the sequence variants. The DADA2 package provides a native implementation of the naive Bayesian classifier method for this purpose. The assignTaxonomy function takes as input a set of sequences to be classified and a training set of reference sequences with known taxonomy, and outputs taxonomic assignments with at least minBoot bootstrap confidence.
+#We maintain formatted training fastas for the RDP training set, GreenGenes clustered at 97% identity, and the Silva reference database, and additional trainings fastas suitable for protists and certain specific environments have been contributed. For fungal taxonomy, the General Fasta release files from the UNITE ITS database can be used as is. To follow along, download the silva_nr_v128_train_set.fa.gz file, and place it in the directory with the fastq files.
+
+#For Magnus use:
+#taxa <- assignTaxonomy(seqtab.nochim,"/storage/bulbul/MiSeq/soya/16s/silva_nr_v138_train_set.fa", multithread=TRUE)
+
+##They use Wang et al method. shred data into kmers. It will take 1/8 of the kmers and will assign taxonomy to them. It will do that 100 times. If you set the boot: 50. It means in 50 draws, the taxonomy was the same, so let's assign that taxonomy to those reads (where the kmers are from); if you put it at 80: in 80 draws it has to be aggreed= more stringent 
+##Silva more comprehnsive than other database. Greengene not maintained
+
+#head(taxa)  ##this is unreadle cause each rownames is the name of the ASV aka its sequence, so we need a way to tell him not to do that
+
+```{r}
+# Assign taxonomy ---------------------------------------------------------
+taxa <- assignTaxonomy(seqtab.nochim,"/Users/bulbulahmed/Documents/Cannabis_project/Cannabis_Cornell_project/hemp_CALS_16S/Root/filtered/silva_nr_v132_train_set.fa", multithread=TRUE)
+taxa.print<-taxa  #removing sequence rownames for display only
+rownames(taxa.print)<-NULL
+head(taxa.print)
+
+#Considerations for your own data: If your reads do not seem to be appropriately assigned, for example lots of your bacterial 16S sequences are being assigned as Eukaryota NA NA NA NA NA, your reads may be in the opposite orientation as the reference database. Tell dada2 to try the reverse-complement orientation with assignTaxonomy(..., tryRC=TRUE) and see if this fixes the assignments. If using DECIPHER for taxonomy, try IdTaxa (..., strand="both")
+
+##There are a lot of NAs but at the family and genus level, so we are not going to tell him to look for the reverse-complement of each sequence
+
+##Extensions: The dada2 package also implements a method to make species level assignments based on exact matching between ASVs and sequenced reference strains. Recent analysis suggests that exact matching (or 100% identity) is the only appropriate way to assign species to 16S gene fragments. Currently, species-assignment training fastas are available for the Silva and RDP 16S databases. To follow the optional species addition step, download the silva_species_assignment_v128.fa.gz file, and place it in the directory with the fastq files. We are going to try that
+
+#memory.size(max = FALSE)
+#memory.limit(size = NA)
+
+taxa.sp <- addSpecies(taxa, "/Users/bulbulahmed/Documents/Cannabis_project/Cannabis_Cornell_project/hemp_CALS_16S/Root/filtered/silva_species_assignment_v138.fa")
+
+#see the result
+taxa.sp.print<-taxa.sp  #removing sequence rownames for display only
+rownames(taxa.sp.print)<-NULL
+head(taxa.sp.print)
+##At least there is species, but there is a lot of NAs
+
+##Lets try to see if the tryRC will work
+taxa.sp.rv <- addSpecies(taxa,"/Users/bulbulahmed/Documents/Cannabis_project/Cannabis_Cornell_project/hemp_CALS_16S/Root/filtered/silva_species_assignment_v138.fa", tryRC=TRUE)
+
+#taxa.sp.rv <- addSpecies(taxa, "silva_species_assignment_v132.fa", tryRC=TRUE)
+#see the result
+taxa.sp.rv.print<-taxa.sp.rv  #removing sequence rownames for display only
+rownames(taxa.sp.rv.print)<-NULL
+head(taxa.sp.rv.print)
+##At least there is species, but there is a lot of NAs, dont think it helped to put the reverse complement, so we are going to discard this one
+```
+# Removing mitochondria and chloroplast -----------------------------------
+##Checking if Kingdom contains Eukaryotes (we already know that it has mitochodria and chloroplast)
+```{r}
+# Removing mitochondria and chloroplast
+taxa.sp.df<-as.data.frame(taxa.sp)
+str(taxa.sp.df)
+
+#Eukaryotes
+"Eukaryote" %in% taxa.sp.df$Kingdom
+##No eukaryotes
+
+#Mitochondria
+"Mitochondria" %in% taxa.sp.df$Family
+##True
+
+#Chloroplast
+"Chloroplast" %in% taxa.sp.df$Order
+##True
+
+##remove Mitochondria and chloroplast in taxa.df and calculate how much of the asv were not bacteria
+keep_vector<-rep(T,nrow(taxa.sp.df))
+keep_vector[taxa.sp.df[,4] == "Chloroplast"] = FALSE
+keep_vector[taxa.sp.df[,5] == "Mitochondria"] = FALSE
+
+print("what fraction of reads are mito/cp?")
+1- sum(seqtab.nochim[,keep_vector==T]) / sum(seqtab.nochim)
+##0.1061989    ###0.1062025
+##ot too bad: only 10.6% of the reads are mitochodria or chloroplast emoving those ASV from the seqtab.nochim and the taxa.sp table
+asv.16S_cals_canna_root<-seqtab.nochim[,keep_vector==T]  #rows: samples; column: ASV
+taxo.16S_cals_canna_root<-taxa.sp[keep_vector==T,]       #rows: ASV; column: phylogenetic levels
+```
+
+# Calculation of number of reads and ASV left after pipeline ----------------------
+```{r}
+##Calculations of reads per samples:
+(asv.sum<-rowSums(asv.16S_cals_canna_root))  ##Looks good
+min(asv.sum);max(asv.sum)  ##1749 and 30 771
+(asv.sum.mean = mean(asv.sum))  ##14 354
+(asv.sum.sd = sd(asv.sum))  #6670
+
+(asv.sort<-sort(rowSums(asv.16S_cals_canna_root)))
+##Lowest reads: JNR21, JLR42...lowest reads seems to be june_roots, july_roots, june_soil and july_soil
+
+dim(asv.16S_cals_canna_root)
+#192 25 854   #### 192 25 852
+dim (taxo.16S_cals_canna_root)
+#25854     7 ### 25852     7
+
+##Final numbers
+##At the enf of the pipeline we have 25 854 16S ASV. The lowest number of sequences per sample left is 1749 JNR21 and it goes up quite rapidely afterwards.
+
+
+# Saving final databases --------------------------------------------------
+##ASV table
+write.table(asv.16S_cals_canna_root, "ASV_16S_cals_canna_root_final.txt", sep="\t")
+
+##Taxonomy table
+write.table(taxo.16S_cals_canna_root, "taxo_16S_cals_canna_root_final.txt", sep="\t")
+
+
+# How to simplified ASV tables for stats ----------------------------------
+##Simplified ASV table
+asv.16S_cals_canna_root.simplified <- asv.16S_cals_canna_root
+colnames(asv.16S_cals_canna_root.simplified) = paste("ASV",c(1:ncol(asv.16S_cals_canna_root)),sep = "")
+write.table(asv.16S_cals_canna_root.simplified, "ASV_16S_cals_canna_root_final_simplified.txt", sep="\t")
+
+##Simplified taxonomy table
+taxo.16S_cals_canna_root.simplified <- cbind(taxo.16S_cals_canna_root,rownames(taxo.16S_cals_canna_root))  ##He puts the sequences as an extra column (I guess if we want to blast it)
+rownames(taxo.16S_cals_canna_root.simplified) <- paste("ASV",c(1:nrow(taxo.16S_cals_canna_root)),sep = "")
+write.table(taxo.16S_cals_canna_root.simplified,"taxonomy.cals_canna_root_16S_final_simplified.txt", sep="\t")
+```
+```{r}
+##Importing database
+ASV<-read.table("ASV_16S_cals_canna_root_final.txt", header=T, row.names=1, stringsAsFactors=F, skip=1)  ###I kept the original file with the ASV name being the sequence and R is unable to open it, so I am going to import it without the names of the col and then give it back
+colnames(ASV) = paste("ASV",c(1:ncol(ASV)),sep = "")
+ASV[1:2,3:5]  ###Just to check. everything seems right
+class(ASV)
+```
+
+```{r}
+##rarefaction curves
+rarecurve(ASV, sample=7610)
+
+
+library(reshape2)
+library(ggplot2)
+
+# This piece of code is counting the number of NA per taxonomic rank
+
+mat=matrix(length(taxo.16S_cals_canna_root[,1]),4,7)
+# Creates a matrix, with 3 rows and 7 columns (Taxranks)
+# Each of the cell contains the total amount of bacterial ASV noSD
+mat<-as.data.frame(mat)
+# Transform it into dataframe
+colnames(mat)[1:7]<- c("Kingdom","Phylum","Class","Order","Family","Genus","Species")
+rownames(mat)[1:4]<- c("ASV taxonomicly assigned ","Percentage (%)"," NA per rank","NA (sum)")
+# specify rownames 
+for (c in 1:7){
+  for (i in 1:length(taxo.16S_cals_canna_root[,1])){
+    if (is.na(taxo.16S_cals_canna_root[i,c]))
+      mat[,c] <- mat[,c] - 1
+    as.numeric(mat[,c])
+  }
+}
+mat[2,] <- round(((mat[1,]/length(taxo.16S_cals_canna_root[,1]))*100),1)
+mat[3,1]=0
+mat[4,1]=0
+for (i in 2:7){
+  mat[3,i] =   mat[1,(i-1)] - mat[1,i]
+  mat[4,i] = sum(mat[3,i],mat[4,i-1])
+} 
+mat <- as.data.frame(mat)
+NA.taxrank <- mat
+save(NA.taxrank,file="NA.per.taxrank.RData")
+
+
+plot.NA.taxrank <- NA.taxrank[c(1,4),]
+rownames(plot.NA.taxrank)[1] <- "Taxonomy assigned"
+rownames(plot.NA.taxrank)[2] <- "NA"
+plot.NA.taxrank$ID <- rownames(plot.NA.taxrank)
+lg.NA.tax <- melt(plot.NA.taxrank, id.vars="ID")
+
+
+NA_hist <- ggplot(lg.NA.tax ,aes(x=variable, y=as.numeric(value), fill=ID)) +
+  ggtitle("Depth of taxonomic assignment") +
+  geom_bar(stat="identity", position ="stack") + 
+  theme_classic() + # Theme
+  theme(plot.title = element_text(color="black", size=14, face="bold", hjust =0.5))+ # Title
+  theme(panel.grid = element_blank(), panel.border = element_blank()) + # Removes the border and grid
+  theme(axis.ticks.length=unit(0.1,"cm")) + # Ticks size
+  # theme(legend.title = element_blank())+ #  delete legend title
+  labs(fill = "Taxonomic status")+
+  scale_x_discrete(name ="Taxonomic Rank", expand = c(0,0)) + 
+  scale_y_continuous(name="ASVs", expand = c(0,0), breaks=seq(from = 0, to = 11000, by = 1000)) 
+# Changes axis title, deletes the space between the graph and the axis and sets the breaks. 
+NA_hist 
+```
+
